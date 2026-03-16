@@ -265,6 +265,7 @@ impl ToolRegistry {
                             invocation_for_tool.turn.tool_call_gate.wait_ready().await;
                             tracing::trace!("tool gate released");
                         }
+                        // xtl toolcall真正执行的位置 匹配注册的工具再执行
                         match handler.handle_any(invocation_for_tool).await {
                             Ok(result) => {
                                 let preview = result.result.log_preview();

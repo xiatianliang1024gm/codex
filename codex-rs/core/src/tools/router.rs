@@ -89,6 +89,7 @@ impl ToolRouter {
             .any(|config| config.spec.name() == tool_name)
     }
 
+    // xtl 工具调用事件的封装，返回的是ToolCall结构体，还未执行
     #[instrument(level = "trace", skip_all, err)]
     pub async fn build_tool_call(
         session: &Session,
@@ -102,6 +103,7 @@ impl ToolRouter {
                 call_id,
                 ..
             } => {
+                // 先判断mcp调用
                 if let Some((server, tool)) = session.parse_mcp_tool_name(&name, &namespace).await {
                     Ok(Some(ToolCall {
                         tool_name: name,

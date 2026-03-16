@@ -419,10 +419,13 @@ impl Codex {
             inherited_shell_snapshot,
             parent_trace: _,
         } = args;
+        // channel, 类似go chan<- chan-> 每个channel都有输入和是输出的处理对象
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
+        // plugins
         let loaded_plugins = plugins_manager.plugins_for_config(&config);
+        // skills
         let loaded_skills = skills_manager.skills_for_config(&config);
 
         for err in &loaded_skills.errors {
@@ -433,6 +436,7 @@ impl Codex {
             );
         }
 
+        // subagent
         if let SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) = session_source
             && depth >= config.agent_max_depth
         {
@@ -477,6 +481,7 @@ impl Codex {
         )
         .await;
 
+        // exec shell policy
         let exec_policy = if crate::guardian::is_guardian_subagent_source(&session_source) {
             // Guardian review should rely on the built-in shell safety checks,
             // not on caller-provided exec-policy rules that could shape the
@@ -1796,6 +1801,7 @@ impl Session {
             sess.send_event_raw(event).await;
         }
 
+        // 监听skill的变化
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
         sess.start_file_watcher_listener();
         // Construct sandbox_state before MCP startup so it can be sent to each
@@ -1831,6 +1837,7 @@ impl Session {
         )
         .await;
         {
+            // 单独的{}包围，避免局部变量名污染
             let mut manager_guard = sess.services.mcp_connection_manager.write().await;
             *manager_guard = mcp_connection_manager;
         }
@@ -1860,6 +1867,8 @@ impl Session {
                 ));
             }
         }
+
+        // prewarm 初始预热 处理resume
         sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
             .await;
         let session_start_source = match &initial_history {
@@ -4036,12 +4045,14 @@ impl Session {
     }
 }
 
+// xtl 主循环 接收事件 调度处理
 async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiver<Submission>) {
     // To break out of this loop, send Op::Shutdown.
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
+            // xtl 处理输入 匹配不同的输入类型，走不同的处理逻辑
             match sub.op.clone() {
                 Op::Interrupt => {
                     handlers::interrupt(&sess).await;
@@ -6114,6 +6125,7 @@ fn codex_apps_connector_id(tool: &crate::mcp_connection_manager::ToolInfo) -> Op
     tool.connector_id.as_deref()
 }
 
+// xtl 组装prompt
 fn build_prompt(
     input: Vec<ResponseItem>,
     router: &ToolRouter,
@@ -6129,6 +6141,8 @@ fn build_prompt(
         output_schema: turn_context.final_output_json_schema.clone(),
     }
 }
+
+// xtl 调用模型
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -6276,6 +6290,7 @@ async fn run_sampling_request(
     }
 }
 
+// xtl 组装工具
 pub(crate) async fn built_tools(
     sess: &Session,
     turn_context: &TurnContext,
@@ -6933,6 +6948,7 @@ async fn drain_in_flight(
     Ok(())
 }
 
+// xtl 调用大模型，处理返回
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
