@@ -20,6 +20,7 @@ use crate::markdown_stream::MarkdownStreamCollector;
 pub(crate) mod chunking;
 pub(crate) mod commit_tick;
 pub(crate) mod controller;
+mod table_holdback;
 
 struct QueuedLine {
     line: Line<'static>,
@@ -70,12 +71,9 @@ impl StreamState {
             .map(|queued| queued.line)
             .collect()
     }
-    /// Drains all queued lines from the front of the queue.
-    pub(crate) fn drain_all(&mut self) -> Vec<Line<'static>> {
-        self.queued_lines
-            .drain(..)
-            .map(|queued| queued.line)
-            .collect()
+    /// Clears queued lines while keeping collector/turn lifecycle state intact.
+    pub(crate) fn clear_queue(&mut self) {
+        self.queued_lines.clear();
     }
     /// Returns whether no lines are queued for commit.
     pub(crate) fn is_idle(&self) -> bool {
@@ -116,10 +114,10 @@ mod tests {
 
     #[test]
     fn drain_n_clamps_to_available_lines() {
-        let mut state = StreamState::new(None, &test_cwd());
+        let mut state = StreamState::new(/*width*/ None, &test_cwd());
         state.enqueue(vec![Line::from("one")]);
 
-        let drained = state.drain_n(8);
+        let drained = state.drain_n(/*max_lines*/ 8);
         assert_eq!(drained, vec![Line::from("one")]);
         assert!(state.is_idle());
     }

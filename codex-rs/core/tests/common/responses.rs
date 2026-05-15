@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -121,6 +123,10 @@ impl ResponsesRequest {
             .trim_matches('"')
             .to_string();
         self.body_json().to_string().contains(&json_fragment)
+    }
+
+    pub fn tool_by_name(&self, namespace: &str, tool_name: &str) -> Option<Value> {
+        namespace_child_tool(&self.body_json(), namespace, tool_name).cloned()
     }
 
     pub fn instructions_text(&self) -> String {
@@ -311,6 +317,31 @@ pub(crate) fn output_value_to_text(value: &Value) -> Option<String> {
         },
         Value::Object(_) | Value::Number(_) | Value::Bool(_) | Value::Null => None,
     }
+}
+
+pub fn namespace_child_tool<'a>(
+    body: &'a Value,
+    namespace: &str,
+    tool_name: &str,
+) -> Option<&'a Value> {
+    let tools = body.get("tools")?.as_array()?;
+    for tool in tools {
+        if tool.get("name").and_then(Value::as_str) != Some(namespace)
+            || tool.get("type").and_then(Value::as_str) != Some("namespace")
+        {
+            continue;
+        }
+
+        let child_tools = tool.get("tools")?.as_array()?;
+        if let Some(child_tool) = child_tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
+        {
+            return Some(child_tool);
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -510,7 +541,14 @@ impl WebSocketTestServer {
 
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(());
-        let _ = self.task.await;
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(10), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -601,6 +639,17 @@ pub fn ev_response_created(id: &str) -> Value {
     })
 }
 
+pub fn ev_model_verification_metadata(id: &str, verifications: Vec<&str>) -> Value {
+    serde_json::json!({
+        "type": "response.metadata",
+        "sequence_number": 1,
+        "response_id": id,
+        "metadata": {
+            "openai_verification_recommendation": verifications,
+        }
+    })
+}
+
 pub fn ev_completed_with_tokens(id: &str, total_tokens: i64) -> Value {
     serde_json::json!({
         "type": "response.completed",
@@ -637,7 +686,6 @@ pub fn user_message_item(text: &str) -> ResponseItem {
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],
-        end_turn: None,
         phase: None,
     }
 }
@@ -778,6 +826,24 @@ pub fn ev_function_call(call_id: &str, name: &str, arguments: &str) -> Value {
     })
 }
 
+pub fn ev_function_call_with_namespace(
+    call_id: &str,
+    namespace: &str,
+    name: &str,
+    arguments: &str,
+) -> Value {
+    serde_json::json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "function_call",
+            "call_id": call_id,
+            "namespace": namespace,
+            "name": name,
+            "arguments": arguments
+        }
+    })
+}
+
 pub fn ev_tool_search_call(call_id: &str, arguments: &serde_json::Value) -> Value {
     serde_json::json!({
         "type": "response.output_item.done",
@@ -824,11 +890,6 @@ pub fn ev_apply_patch_call(
 ) -> Value {
     match output_type {
         ApplyPatchModelOutput::Freeform => ev_apply_patch_custom_tool_call(call_id, patch),
-        ApplyPatchModelOutput::Function => ev_apply_patch_function_call(call_id, patch),
-        ApplyPatchModelOutput::Shell => ev_apply_patch_shell_call(call_id, patch),
-        ApplyPatchModelOutput::ShellViaHeredoc => {
-            ev_apply_patch_shell_call_via_heredoc(call_id, patch)
-        }
         ApplyPatchModelOutput::ShellCommandViaHeredoc => {
             ev_apply_patch_shell_command_call_via_heredoc(call_id, patch)
         }
@@ -837,7 +898,7 @@ pub fn ev_apply_patch_call(
 
 /// Convenience: SSE event for an `apply_patch` custom tool call with raw patch
 /// text. This mirrors the payload produced by the Responses API when the model
-/// invokes `apply_patch` directly (before we convert it to a function call).
+/// invokes `apply_patch` directly.
 pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
     serde_json::json!({
         "type": "response.output_item.done",
@@ -845,24 +906,6 @@ pub fn ev_apply_patch_custom_tool_call(call_id: &str, patch: &str) -> Value {
             "type": "custom_tool_call",
             "name": "apply_patch",
             "input": patch,
-            "call_id": call_id
-        }
-    })
-}
-
-/// Convenience: SSE event for an `apply_patch` function call. The Responses API
-/// wraps the patch content in a JSON string under the `input` key; we recreate
-/// the same structure so downstream code exercises the full parsing path.
-pub fn ev_apply_patch_function_call(call_id: &str, patch: &str) -> Value {
-    let arguments = serde_json::json!({ "input": patch });
-    let arguments = serde_json::to_string(&arguments).expect("serialize apply_patch arguments");
-
-    serde_json::json!({
-        "type": "response.output_item.done",
-        "item": {
-            "type": "function_call",
-            "name": "apply_patch",
-            "arguments": arguments,
             "call_id": call_id
         }
     })
@@ -876,21 +919,6 @@ pub fn ev_shell_command_call(call_id: &str, command: &str) -> Value {
 pub fn ev_shell_command_call_with_args(call_id: &str, args: &serde_json::Value) -> Value {
     let arguments = serde_json::to_string(args).expect("serialize shell command arguments");
     ev_function_call(call_id, "shell_command", &arguments)
-}
-
-pub fn ev_apply_patch_shell_call(call_id: &str, patch: &str) -> Value {
-    let args = serde_json::json!({ "command": ["apply_patch", patch] });
-    let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
-
-    ev_function_call(call_id, "shell", &arguments)
-}
-
-pub fn ev_apply_patch_shell_call_via_heredoc(call_id: &str, patch: &str) -> Value {
-    let script = format!("apply_patch <<'EOF'\n{patch}\nEOF\n");
-    let args = serde_json::json!({ "command": ["bash", "-lc", script] });
-    let arguments = serde_json::to_string(&args).expect("serialize apply_patch arguments");
-
-    ev_function_call(call_id, "shell", &arguments)
 }
 
 pub fn ev_apply_patch_shell_command_call_via_heredoc(call_id: &str, patch: &str) -> Value {

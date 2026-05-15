@@ -1,23 +1,29 @@
-pub mod code_mode;
-pub(crate) mod code_mode_description;
-pub mod context;
-pub(crate) mod discoverable;
-pub mod events;
+pub(crate) mod code_mode;
+pub(crate) mod context;
+pub(crate) mod events;
 pub(crate) mod handlers;
-pub mod js_repl;
+pub(crate) mod hook_names;
+pub(crate) mod hosted_spec;
 pub(crate) mod network_approval;
-pub mod orchestrator;
-pub mod parallel;
-pub mod registry;
-pub mod router;
-pub mod runtimes;
-pub mod sandboxing;
-pub mod spec;
+pub(crate) mod orchestrator;
+pub(crate) mod parallel;
+pub(crate) mod registry;
+pub(crate) mod router;
+pub(crate) mod runtimes;
+pub(crate) mod sandboxing;
+pub(crate) mod spec;
+pub(crate) mod spec_plan;
+pub(crate) mod spec_plan_types;
+pub(crate) mod tool_dispatch_trace;
+pub(crate) mod tool_search_entry;
 
-use crate::exec::ExecToolCallOutput;
-use crate::truncate::TruncationPolicy;
-use crate::truncate::formatted_truncate_text;
-use crate::truncate::truncate_text;
+use std::borrow::Cow;
+
+use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_tools::ToolName;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::formatted_truncate_text;
+use codex_utils_output_truncation::truncate_text;
 pub use router::ToolRouter;
 use serde::Serialize;
 
@@ -26,6 +32,21 @@ pub(crate) const TELEMETRY_PREVIEW_MAX_BYTES: usize = 2 * 1024; // 2 KiB
 pub(crate) const TELEMETRY_PREVIEW_MAX_LINES: usize = 64; // lines
 pub(crate) const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str =
     "[... telemetry preview truncated ...]";
+
+/// Legacy boundaries such as hook payloads, telemetry tags, and Responses tool
+/// names still require a single flattened string. Keep comparisons and sorting
+/// on `ToolName` itself; use this only when crossing those boundaries.
+pub(crate) fn flat_tool_name(tool_name: &ToolName) -> Cow<'_, str> {
+    match tool_name.namespace.as_deref() {
+        Some(namespace) => {
+            let mut name = String::with_capacity(namespace.len() + tool_name.name.len());
+            name.push_str(namespace);
+            name.push_str(&tool_name.name);
+            Cow::Owned(name)
+        }
+        None => Cow::Borrowed(tool_name.name.as_str()),
+    }
+}
 
 /// Format the combined exec output for sending back to the model.
 /// Includes exit code and duration metadata; truncates large bodies safely.

@@ -2,13 +2,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
-use codex_core::CodexAuth;
-use codex_core::features::Feature;
-use codex_core::models_manager::manager::ModelsManager;
-use codex_core::models_manager::manager::RefreshStrategy;
+use codex_features::Feature;
+use codex_login::CodexAuth;
+use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelServiceTier;
 use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -23,7 +24,6 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use serde_json::Value;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::time::sleep;
@@ -53,6 +53,7 @@ fn test_model_info(
     visibility: ModelVisibility,
     default_reasoning_level: ReasoningEffort,
     supported_reasoning_levels: Vec<ReasoningEffortPreset>,
+    service_tiers: Vec<ModelServiceTier>,
 ) -> ModelInfo {
     ModelInfo {
         slug: slug.to_string(),
@@ -64,10 +65,11 @@ fn test_model_info(
         visibility,
         supported_in_api: true,
         input_modalities: default_input_modalities(),
-        prefer_websockets: false,
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         priority: 1,
+        additional_speed_tiers: Vec::new(),
+        service_tiers,
         upgrade: None,
         base_instructions: "base instructions".to_string(),
         model_messages: None,
@@ -78,17 +80,18 @@ fn test_model_info(
         availability_nux: None,
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
-        truncation_policy: TruncationPolicyConfig::bytes(10_000),
+        truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
+        max_context_window: None,
         auto_compact_token_limit: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
     }
 }
 
-async fn wait_for_model_available(manager: &Arc<ModelsManager>, slug: &str) {
+async fn wait_for_model_available(manager: &SharedModelsManager, slug: &str) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let available_models = manager.list_models(RefreshStrategy::Online).await;
@@ -125,6 +128,11 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                             description: "Deep dive".to_string(),
                         },
                     ],
+                    vec![ModelServiceTier {
+                        id: "priority".to_string(),
+                        name: "Fast".to_string(),
+                        description: "1.5x speed, increased usage".to_string(),
+                    }],
                 ),
                 test_model_info(
                     "hidden-model",
@@ -136,6 +144,7 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
                         effort: ReasoningEffort::Low,
                         description: "Not visible".to_string(),
                     }],
+                    Vec::new(),
                 ),
             ],
         },
@@ -170,12 +179,34 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
         "expected visible model summary in spawn_agent description: {description:?}"
     );
     assert!(
+        description
+            .contains("Available model overrides (optional; inherited parent model is preferred):"),
+        "expected model choices to be framed as overrides in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains(
+            "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed."
+        ),
+        "expected inherited-model guidance in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description.contains(
+            "Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason."
+        ),
+        "expected model override usage guidance in spawn_agent description: {description:?}"
+    );
+    assert!(
         description.contains("Default reasoning effort: medium."),
         "expected default reasoning effort in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains("low (Quick scan), high (Deep dive)."),
         "expected reasoning efforts in spawn_agent description: {description:?}"
+    );
+    assert!(
+        description
+            .contains("Supported service tiers: priority (Fast: 1.5x speed, increased usage)."),
+        "expected service tier guidance in spawn_agent description: {description:?}"
     );
     assert!(
         !description.contains("Hidden Model"),
@@ -198,6 +229,10 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
             "Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself."
         ),
         "expected agent-role clarification in spawn_agent description: {description:?}"
+    );
+    assert!(
+        !description.contains("A mini model can solve many tasks faster than the main model."),
+        "spawn_agent description should not encourage choosing a smaller model by default: {description:?}"
     );
 
     Ok(())

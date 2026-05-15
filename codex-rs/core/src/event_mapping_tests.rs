@@ -1,8 +1,13 @@
 use super::parse_turn_item;
+use crate::context::ContextualUserFragment;
+use crate::context::GoalContext;
 use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::WebSearchItem;
+use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
@@ -24,12 +29,13 @@ fn parses_user_message_with_text_and_two_images() {
             },
             ContentItem::InputImage {
                 image_url: img1.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputImage {
                 image_url: img2.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
         ],
-        end_turn: None,
         phase: None,
     };
 
@@ -54,7 +60,7 @@ fn parses_user_message_with_text_and_two_images() {
 #[test]
 fn skips_local_image_label_text() {
     let image_url = "data:image/png;base64,abc".to_string();
-    let label = codex_protocol::models::local_image_open_tag_text(1);
+    let label = codex_protocol::models::local_image_open_tag_text(/*label_number*/ 1);
     let user_text = "Please review this image.".to_string();
 
     let item = ResponseItem::Message {
@@ -64,6 +70,7 @@ fn skips_local_image_label_text() {
             ContentItem::InputText { text: label },
             ContentItem::InputImage {
                 image_url: image_url.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
                 text: "</image>".to_string(),
@@ -72,7 +79,6 @@ fn skips_local_image_label_text() {
                 text: user_text.clone(),
             },
         ],
-        end_turn: None,
         phase: None,
     };
 
@@ -94,6 +100,42 @@ fn skips_local_image_label_text() {
 }
 
 #[test]
+fn parses_assistant_message_input_text_for_backward_compatibility() {
+    let item = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue"
+                .to_string(),
+        }],
+        phase: None,
+    };
+
+    let turn_item = parse_turn_item(&item).expect("expected assistant message turn item");
+
+    match turn_item {
+        TurnItem::AgentMessage(message) => {
+            let rendered = message
+                .content
+                .into_iter()
+                .map(|content| {
+                    let AgentMessageContent::Text { text } = content;
+                    text
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rendered,
+                vec![
+                    "author: /root\nrecipient: /root/worker\nother_recipients: []\nContent: continue"
+                        .to_string()
+                ]
+            );
+        }
+        other => panic!("expected TurnItem::AgentMessage, got {other:?}"),
+    }
+}
+
+#[test]
 fn skips_unnamed_image_label_text() {
     let image_url = "data:image/png;base64,abc".to_string();
     let label = codex_protocol::models::image_open_tag_text();
@@ -106,6 +148,7 @@ fn skips_unnamed_image_label_text() {
             ContentItem::InputText { text: label },
             ContentItem::InputImage {
                 image_url: image_url.clone(),
+                detail: Some(DEFAULT_IMAGE_DETAIL),
             },
             ContentItem::InputText {
                 text: codex_protocol::models::image_close_tag_text(),
@@ -114,7 +157,6 @@ fn skips_unnamed_image_label_text() {
                 text: user_text.clone(),
             },
         ],
-        end_turn: None,
         phase: None,
     };
 
@@ -144,7 +186,6 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -153,7 +194,6 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "<environment_context>test_text</environment_context>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -162,7 +202,6 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "# AGENTS.md instructions for test_directory\n\n<INSTRUCTIONS>\ntest_text\n</INSTRUCTIONS>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -172,7 +211,6 @@ fn skips_user_instructions_and_env() {
                     text: "<skill>\n<name>demo</name>\n<path>skills/demo/SKILL.md</path>\nbody\n</skill>"
                         .to_string(),
                 }],
-                end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -181,7 +219,6 @@ fn skips_user_instructions_and_env() {
                 content: vec![ContentItem::InputText {
                     text: "<user_shell_command>echo 42</user_shell_command>".to_string(),
                 }],
-                end_turn: None,
             phase: None,
             },
             ResponseItem::Message {
@@ -197,7 +234,6 @@ fn skips_user_instructions_and_env() {
                                 .to_string(),
                     },
                 ],
-                end_turn: None,
                 phase: None,
             },
         ];
@@ -209,6 +245,83 @@ fn skips_user_instructions_and_env() {
 }
 
 #[test]
+fn parses_hook_prompt_message_as_distinct_turn_item() {
+    let item = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
+        "Retry with exactly the phrase meow meow meow.",
+        "hook-run-1",
+    )])
+    .expect("hook prompt message");
+
+    let turn_item = parse_turn_item(&item).expect("expected hook prompt turn item");
+
+    match turn_item {
+        TurnItem::HookPrompt(hook_prompt) => {
+            assert_eq!(hook_prompt.fragments.len(), 1);
+            assert_eq!(
+                hook_prompt.fragments[0],
+                HookPromptFragment {
+                    text: "Retry with exactly the phrase meow meow meow.".to_string(),
+                    hook_run_id: "hook-run-1".to_string(),
+                }
+            );
+        }
+        other => panic!("expected TurnItem::HookPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_hook_prompt_and_hides_other_contextual_fragments() {
+    let item = ResponseItem::Message {
+        id: Some("msg-1".to_string()),
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "<environment_context>ctx</environment_context>".to_string(),
+            },
+            ContentItem::InputText {
+                text:
+                    "<hook_prompt hook_run_id=\"hook-run-1\">Retry with care &amp; joy.</hook_prompt>"
+                        .to_string(),
+            },
+        ],
+        phase: None,
+    };
+
+    let turn_item = parse_turn_item(&item).expect("expected hook prompt turn item");
+
+    match turn_item {
+        TurnItem::HookPrompt(hook_prompt) => {
+            assert_eq!(hook_prompt.id, "msg-1");
+            assert_eq!(
+                hook_prompt.fragments,
+                vec![HookPromptFragment {
+                    text: "Retry with care & joy.".to_string(),
+                    hook_run_id: "hook-run-1".to_string(),
+                }]
+            );
+        }
+        other => panic!("expected TurnItem::HookPrompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_context_does_not_parse_as_visible_turn_item() {
+    let item = ResponseItem::Message {
+        id: Some("msg-1".to_string()),
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: GoalContext {
+                prompt: "Continue working toward the active thread goal.".to_string(),
+            }
+            .render(),
+        }],
+        phase: None,
+    };
+
+    assert!(parse_turn_item(&item).is_none());
+}
+
+#[test]
 fn parses_agent_message() {
     let item = ResponseItem::Message {
         id: Some("msg-1".to_string()),
@@ -216,7 +329,6 @@ fn parses_agent_message() {
         content: vec![ContentItem::OutputText {
             text: "Hello from Codex".to_string(),
         }],
-        end_turn: None,
         phase: None,
     };
 

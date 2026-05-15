@@ -23,7 +23,7 @@ use tracing::info_span;
 
 pub(crate) fn request_span(
     request: &JSONRPCRequest,
-    transport: AppServerTransport,
+    transport: &AppServerTransport,
     connection_id: ConnectionId,
     session: &ConnectionSessionState,
 ) -> Span {
@@ -72,27 +72,29 @@ pub(crate) fn typed_request_span(
         &span,
         client_info
             .map(|(client_name, _)| client_name)
-            .or(session.app_server_client_name.as_deref()),
+            .or(session.app_server_client_name()),
         client_info
             .map(|(_, client_version)| client_version)
-            .or(session.client_version.as_deref()),
+            .or(session.client_version()),
     );
 
-    attach_parent_context(&span, &method, request.id(), None);
+    attach_parent_context(&span, &method, request.id(), /*parent_trace*/ None);
     span
 }
 
-fn transport_name(transport: AppServerTransport) -> &'static str {
+fn transport_name(transport: &AppServerTransport) -> &'static str {
     match transport {
         AppServerTransport::Stdio => "stdio",
+        AppServerTransport::UnixSocket { .. } => "unix_socket",
         AppServerTransport::WebSocket { .. } => "websocket",
+        AppServerTransport::Off => "off",
     }
 }
 
 fn app_server_request_span_template(
     method: &str,
     transport: &'static str,
-    request_id: &impl std::fmt::Debug,
+    request_id: &impl std::fmt::Display,
     connection_id: ConnectionId,
 ) -> Span {
     info_span!(
@@ -102,11 +104,12 @@ fn app_server_request_span_template(
         rpc.system = "jsonrpc",
         rpc.method = method,
         rpc.transport = transport,
-        rpc.request_id = ?request_id,
-        app_server.connection_id = ?connection_id,
+        rpc.request_id = %request_id,
+        app_server.connection_id = %connection_id,
         app_server.api_version = "v2",
         app_server.client_name = field::Empty,
         app_server.client_version = field::Empty,
+        turn.id = field::Empty,
     )
 }
 
@@ -122,14 +125,14 @@ fn record_client_info(span: &Span, client_name: Option<&str>, client_version: Op
 fn attach_parent_context(
     span: &Span,
     method: &str,
-    request_id: &impl std::fmt::Debug,
+    request_id: &impl std::fmt::Display,
     parent_trace: Option<&W3cTraceContext>,
 ) {
     if let Some(trace) = parent_trace {
         if !set_parent_from_w3c_trace_context(span, trace) {
             tracing::warn!(
                 rpc_method = method,
-                rpc_request_id = ?request_id,
+                rpc_request_id = %request_id,
                 "ignoring invalid inbound request trace carrier"
             );
         }
@@ -145,7 +148,7 @@ fn client_name<'a>(
     if let Some(params) = initialize_client_info {
         return Some(params.client_info.name.as_str());
     }
-    session.app_server_client_name.as_deref()
+    session.app_server_client_name()
 }
 
 fn client_version<'a>(
@@ -155,7 +158,7 @@ fn client_version<'a>(
     if let Some(params) = initialize_client_info {
         return Some(params.client_info.version.as_str());
     }
-    session.client_version.as_deref()
+    session.client_version()
 }
 
 fn initialize_client_info(request: &JSONRPCRequest) -> Option<InitializeParams> {

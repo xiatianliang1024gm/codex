@@ -1,15 +1,15 @@
 use crate::config::Config;
-use crate::config::ConfigToml;
 use crate::config::edit::ConfigEditsBuilder;
-use crate::config::profile::ConfigProfile;
-use crate::config::types::WindowsSandboxModeToml;
-use crate::default_client::originator;
-use crate::features::Feature;
-use crate::features::Features;
-use crate::features::FeaturesToml;
-use crate::protocol::SandboxPolicy;
+use codex_config::config_toml::ConfigToml;
+use codex_config::profile_toml::ConfigProfile;
+use codex_config::types::WindowsSandboxModeToml;
+use codex_features::Feature;
+use codex_features::Features;
+use codex_features::FeaturesToml;
+use codex_login::default_client::originator;
 use codex_otel::sanitize_metric_tag_value;
 use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::protocol::SandboxPolicy;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::Path;
@@ -75,8 +75,21 @@ pub fn resolve_windows_sandbox_mode(
         .or_else(|| legacy_windows_sandbox_mode(cfg.features.as_ref()))
 }
 
+pub fn resolve_windows_sandbox_private_desktop(cfg: &ConfigToml, profile: &ConfigProfile) -> bool {
+    profile
+        .windows
+        .as_ref()
+        .and_then(|windows| windows.sandbox_private_desktop)
+        .or_else(|| {
+            cfg.windows
+                .as_ref()
+                .and_then(|windows| windows.sandbox_private_desktop)
+        })
+        .unwrap_or(true)
+}
+
 fn legacy_windows_sandbox_keys_present(features: Option<&FeaturesToml>) -> bool {
-    let Some(entries) = features.map(|features| &features.entries) else {
+    let Some(entries) = features.map(FeaturesToml::entries) else {
         return false;
     };
     entries.contains_key(Feature::WindowsSandboxElevated.key())
@@ -87,8 +100,8 @@ fn legacy_windows_sandbox_keys_present(features: Option<&FeaturesToml>) -> bool 
 pub fn legacy_windows_sandbox_mode(
     features: Option<&FeaturesToml>,
 ) -> Option<WindowsSandboxModeToml> {
-    let entries = features.map(|features| &features.entries)?;
-    legacy_windows_sandbox_mode_from_entries(entries)
+    let entries = features.map(FeaturesToml::entries)?;
+    legacy_windows_sandbox_mode_from_entries(&entries)
 }
 
 pub fn legacy_windows_sandbox_mode_from_entries(
@@ -167,13 +180,15 @@ pub fn run_elevated_setup(
     codex_home: &Path,
 ) -> anyhow::Result<()> {
     codex_windows_sandbox::run_elevated_setup(
-        policy,
-        policy_cwd,
-        command_cwd,
-        env_map,
-        codex_home,
-        None,
-        None,
+        codex_windows_sandbox::SandboxSetupRequest {
+            policy,
+            policy_cwd,
+            command_cwd,
+            env_map,
+            codex_home,
+            proxy_enforced: false,
+        },
+        codex_windows_sandbox::SetupRootOverrides::default(),
     )
 }
 
@@ -221,6 +236,7 @@ pub fn run_setup_refresh_with_extra_read_roots(
         env_map,
         codex_home,
         extra_read_roots,
+        /*proxy_enforced*/ false,
     )
 }
 
@@ -347,7 +363,7 @@ fn emit_windows_sandbox_setup_success_metrics(
     originator_tag: &str,
     duration: std::time::Duration,
 ) {
-    let Some(metrics) = codex_otel::metrics::global() else {
+    let Some(metrics) = codex_otel::global() else {
         return;
     };
     let mode_tag = windows_sandbox_setup_mode_tag(mode);
@@ -362,7 +378,7 @@ fn emit_windows_sandbox_setup_success_metrics(
     );
     let _ = metrics.counter(
         "codex.windows_sandbox.setup_success",
-        1,
+        /*inc*/ 1,
         &[("originator", originator_tag), ("mode", mode_tag)],
     );
 }
@@ -373,7 +389,7 @@ fn emit_windows_sandbox_setup_failure_metrics(
     duration: std::time::Duration,
     _err: &anyhow::Error,
 ) {
-    let Some(metrics) = codex_otel::metrics::global() else {
+    let Some(metrics) = codex_otel::global() else {
         return;
     };
     let mode_tag = windows_sandbox_setup_mode_tag(mode);
@@ -388,7 +404,7 @@ fn emit_windows_sandbox_setup_failure_metrics(
     );
     let _ = metrics.counter(
         "codex.windows_sandbox.setup_failure",
-        1,
+        /*inc*/ 1,
         &[("originator", originator_tag), ("mode", mode_tag)],
     );
 
@@ -408,12 +424,16 @@ fn emit_windows_sandbox_setup_failure_metrics(
             if let Some(message) = message_tag.as_deref() {
                 failure_tags.push(("message", message));
             }
-            let _ = metrics.counter(elevated_setup_failure_metric_name(_err), 1, &failure_tags);
+            let _ = metrics.counter(
+                elevated_setup_failure_metric_name(_err),
+                /*inc*/ 1,
+                &failure_tags,
+            );
         }
     } else {
         let _ = metrics.counter(
             "codex.windows_sandbox.legacy_setup_preflight_failed",
-            1,
+            /*inc*/ 1,
             &[("originator", originator_tag)],
         );
     }
