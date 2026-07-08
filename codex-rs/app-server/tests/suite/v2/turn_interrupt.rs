@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use anyhow::Result;
-use app_test_support::McpProcess;
+use app_test_support::TestAppServer;
 use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
@@ -57,7 +57,11 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
         .await;
     create_config_toml(&codex_home, &server.uri(), "never", "workspace-write")?;
 
-    let mut mcp = McpProcess::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     // Start a v2 thread and capture its id.
@@ -78,6 +82,7 @@ async fn turn_interrupt_aborts_running_turn() -> Result<()> {
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run sleep".to_string(),
                 text_elements: Vec::new(),
@@ -140,11 +145,14 @@ async fn turn_interrupt_rejects_completed_turn() -> Result<()> {
     .await;
     create_config_toml(&codex_home, &server.uri(), "never", "workspace-write")?;
 
-    let mut mcp = McpProcess::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
-        .send_thread_start_request(ThreadStartParams {
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
             model: Some("mock-model".to_string()),
             ..Default::default()
         })
@@ -159,6 +167,7 @@ async fn turn_interrupt_rejects_completed_turn() -> Result<()> {
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "say done".to_string(),
                 text_elements: Vec::new(),
@@ -234,7 +243,11 @@ async fn turn_interrupt_resolves_pending_command_approval_request() -> Result<()
     .await;
     create_config_toml(&codex_home, &server.uri(), "untrusted", "read-only")?;
 
-    let mut mcp = McpProcess::new(&codex_home).await?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(&codex_home)
+        .without_auto_env()
+        .build()
+        .await?;
     timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
 
     let thread_req = mcp
@@ -253,6 +266,7 @@ async fn turn_interrupt_resolves_pending_command_approval_request() -> Result<()
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread.id.clone(),
+            client_user_message_id: None,
             input: vec![V2UserInput::Text {
                 text: "run python".to_string(),
                 text_elements: Vec::new(),

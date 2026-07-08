@@ -14,19 +14,21 @@ mod cwd_junction;
 use anyhow::Context;
 use anyhow::Result;
 use codex_windows_sandbox::ErrorPayload;
+use codex_windows_sandbox::ErrorStage;
 use codex_windows_sandbox::ExitPayload;
 use codex_windows_sandbox::FramedMessage;
+use codex_windows_sandbox::IPC_PROTOCOL_VERSION;
 use codex_windows_sandbox::LocalSid;
 use codex_windows_sandbox::Message;
 use codex_windows_sandbox::OutputPayload;
 use codex_windows_sandbox::OutputStream;
 use codex_windows_sandbox::PipeSpawnHandles;
 use codex_windows_sandbox::ResizePayload;
-use codex_windows_sandbox::SandboxPolicy;
 use codex_windows_sandbox::SpawnReady;
 use codex_windows_sandbox::SpawnRequest;
 use codex_windows_sandbox::StderrMode;
 use codex_windows_sandbox::StdinMode;
+use codex_windows_sandbox::WindowsSandboxTokenMode;
 use codex_windows_sandbox::allow_null_device;
 use codex_windows_sandbox::create_readonly_token_with_caps_and_user_from;
 use codex_windows_sandbox::create_workspace_write_token_with_caps_and_user_from;
@@ -35,11 +37,11 @@ use codex_windows_sandbox::encode_bytes;
 use codex_windows_sandbox::get_current_token_for_restriction;
 use codex_windows_sandbox::hide_current_user_profile_dir;
 use codex_windows_sandbox::log_note;
-use codex_windows_sandbox::parse_policy;
 use codex_windows_sandbox::read_frame;
 use codex_windows_sandbox::read_handle_loop;
 use codex_windows_sandbox::spawn_process_with_pipes;
 use codex_windows_sandbox::to_wide;
+use codex_windows_sandbox::token_mode_for_permission_profile;
 use codex_windows_sandbox::write_frame;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -165,13 +167,19 @@ fn open_pipe(name: &str, access: u32) -> Result<HANDLE> {
 }
 
 /// Send an error frame back to the parent process.
-fn send_error(writer: &Arc<StdMutex<File>>, code: &str, message: String) -> Result<()> {
+fn send_error(
+    writer: &Arc<StdMutex<File>>,
+    stage: ErrorStage,
+    windows_error_code: Option<u32>,
+    message: String,
+) -> Result<()> {
     let msg = FramedMessage {
-        version: 1,
+        version: IPC_PROTOCOL_VERSION,
         message: Message::Error {
             payload: ErrorPayload {
                 message,
-                code: code.to_string(),
+                stage,
+                windows_error_code,
             },
         },
     };
@@ -181,12 +189,21 @@ fn send_error(writer: &Arc<StdMutex<File>>, code: &str, message: String) -> Resu
     Ok(())
 }
 
+fn windows_error_code(err: &anyhow::Error) -> Option<u32> {
+    err.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .and_then(|code| u32::try_from(code).ok())
+    })
+}
+
 /// Read and validate the initial spawn request frame.
 fn read_spawn_request(reader: &mut File) -> Result<SpawnRequest> {
     let Some(msg) = read_frame(reader)? else {
         anyhow::bail!("runner: pipe closed before spawn_request");
     };
-    if msg.version != 1 {
+    if msg.version != IPC_PROTOCOL_VERSION {
         anyhow::bail!("runner: unsupported protocol version {}", msg.version);
     }
     match msg.message {
@@ -235,7 +252,13 @@ fn effective_cwd(req_cwd: &Path, log_dir: Option<&Path>) -> PathBuf {
 fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     let log_dir = req.codex_home.clone();
     hide_current_user_profile_dir(req.codex_home.as_path());
-    let policy = parse_policy(&req.policy_json_or_preset).context("parse policy_json_or_preset")?;
+    let token_mode = token_mode_for_permission_profile(
+        &req.permission_profile,
+        &req.workspace_roots,
+        &req.cwd,
+        &req.env,
+    )
+    .context("resolve permission profile token mode")?;
     let mut cap_psids: Vec<LocalSid> = Vec::new();
     for sid in &req.cap_sids {
         cap_psids.push(
@@ -253,15 +276,12 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     let cap_psid_ptrs: Vec<*mut _> = cap_psids.iter().map(LocalSid::as_ptr).collect();
     let base = OwnedWinHandle::new(unsafe { get_current_token_for_restriction()? });
     let h_token = OwnedWinHandle::new(unsafe {
-        match &policy {
-            SandboxPolicy::ReadOnly { .. } => {
+        match token_mode {
+            WindowsSandboxTokenMode::ReadOnlyCapability => {
                 create_readonly_token_with_caps_and_user_from(base.raw(), &cap_psid_ptrs)
             }
-            SandboxPolicy::WorkspaceWrite { .. } => {
+            WindowsSandboxTokenMode::WritableRootsCapability => {
                 create_workspace_write_token_with_caps_and_user_from(base.raw(), &cap_psid_ptrs)
-            }
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
-                unreachable!()
             }
         }
     }?);
@@ -352,7 +372,7 @@ fn spawn_output_reader(
 ) -> std::thread::JoinHandle<()> {
     read_handle_loop(handle, move |chunk| {
         let msg = FramedMessage {
-            version: 1,
+            version: IPC_PROTOCOL_VERSION,
             message: Message::Output {
                 payload: OutputPayload {
                     data_b64: encode_bytes(chunk),
@@ -524,7 +544,12 @@ pub fn main() -> Result<()> {
     let req = match read_spawn_request(&mut pipe_read) {
         Ok(v) => v,
         Err(err) => {
-            let _ = send_error(&pipe_write, "spawn_failed", err.to_string());
+            let _ = send_error(
+                &pipe_write,
+                ErrorStage::ReadSpawnRequest,
+                /*windows_error_code*/ None,
+                err.to_string(),
+            );
             return Err(err);
         }
     };
@@ -532,7 +557,12 @@ pub fn main() -> Result<()> {
     let ipc_spawn = match spawn_ipc_process(&req) {
         Ok(value) => value,
         Err(err) => {
-            let _ = send_error(&pipe_write, "spawn_failed", err.to_string());
+            let _ = send_error(
+                &pipe_write,
+                ErrorStage::SpawnChild,
+                windows_error_code(&err),
+                err.to_string(),
+            );
             return Err(err);
         }
     };
@@ -554,7 +584,7 @@ pub fn main() -> Result<()> {
     let process_handle = Arc::new(StdMutex::new(Some(pi.hProcess)));
 
     let msg = FramedMessage {
-        version: 1,
+        version: IPC_PROTOCOL_VERSION,
         message: Message::SpawnReady {
             payload: SpawnReady {
                 process_id: unsafe { GetProcessId(pi.hProcess) },
@@ -566,7 +596,12 @@ pub fn main() -> Result<()> {
     } else {
         anyhow::bail!("runner spawn_ready write failed: pipe_write lock poisoned");
     } {
-        let _ = send_error(&pipe_write, "spawn_failed", err.to_string());
+        let _ = send_error(
+            &pipe_write,
+            ErrorStage::WriteSpawnReady,
+            /*windows_error_code*/ None,
+            err.to_string(),
+        );
         return Err(err);
     }
     let log_dir_owned = log_dir.map(Path::to_path_buf);
@@ -631,7 +666,7 @@ pub fn main() -> Result<()> {
     }
 
     let exit_msg = FramedMessage {
-        version: 1,
+        version: IPC_PROTOCOL_VERSION,
         message: Message::Exit {
             payload: ExitPayload {
                 exit_code,

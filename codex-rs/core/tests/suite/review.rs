@@ -23,11 +23,13 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
@@ -61,7 +63,7 @@ async fn review_op_emits_lifecycle_and_review_output() {
         "overall_confidence_score": 0.8
     })
     .to_string();
-    let (server, _request_log) = start_responses_server_with_sse(
+    let (server, request_log) = start_responses_server_with_sse(
         assistant_message_sse(&review_json),
         /*expected_requests*/ 1,
     )
@@ -111,11 +113,39 @@ async fn review_op_emits_lifecycle_and_review_output() {
     assert_eq!(expected, review);
     let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
-    // Also verify that a user message with the header and a formatted finding
-    // was recorded back in the parent session's rollout.
     let path = codex.rollout_path().expect("rollout path");
     let text = std::fs::read_to_string(&path).expect("read rollout file");
+    let parent_thread_id = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .find_map(|line| {
+            let rollout_line: RolloutLine = serde_json::from_str(line).expect("rollout line");
+            match rollout_line.item {
+                RolloutItem::SessionMeta(session_meta) => Some(session_meta.meta.id.to_string()),
+                _ => None,
+            }
+        })
+        .expect("parent session meta");
 
+    let request = request_log.single_request();
+    assert_eq!(
+        request.header("x-openai-subagent").as_deref(),
+        Some("review")
+    );
+    let turn_metadata: serde_json::Value = serde_json::from_str(
+        &request
+            .header("x-codex-turn-metadata")
+            .expect("review request turn metadata"),
+    )
+    .expect("review request turn metadata json");
+    assert!(turn_metadata.get("forked_from_thread_id").is_none());
+    assert_eq!(
+        turn_metadata["parent_thread_id"].as_str(),
+        Some(parent_thread_id.as_str())
+    );
+
+    // Also verify that a user message with the header and a formatted finding
+    // was recorded back in the parent session's rollout.
     let mut saw_header = false;
     let mut saw_finding_line = false;
     let expected_assistant_text = render_review_output_text(&expected);
@@ -166,6 +196,95 @@ async fn review_op_emits_lifecycle_and_review_output() {
         !saw_assistant_xml,
         "assistant review output contains user_action markup"
     );
+
+    let _codex_home_guard = codex_home;
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_review_does_not_forward_delegate_mcp_startup() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let request_log = responses::mount_response_once(
+        &server,
+        responses::sse_response(responses::sse(vec![responses::ev_response_created(
+            "resp-1",
+        )]))
+        .set_delay(Duration::from_secs(30)),
+    )
+    .await;
+    let codex_home = Arc::new(TempDir::new().unwrap());
+    let codex = new_conversation_for_server(&server, codex_home.clone(), |_| {}).await;
+
+    // Consume the parent session's own empty startup round before starting the review.
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::McpStartupComplete(_))
+    })
+    .await;
+
+    codex
+        .submit(Op::Review {
+            review_request: ReviewRequest {
+                target: ReviewTarget::Custom {
+                    instructions: "Cancel this review".to_string(),
+                },
+                user_facing_hint: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match codex.next_event().await.expect("review event").msg {
+                event @ (EventMsg::McpStartupUpdate(_) | EventMsg::McpStartupComplete(_)) => {
+                    panic!("review forwarded delegate MCP startup: {event:?}")
+                }
+                EventMsg::EnteredReviewMode(_) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for review entry");
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while request_log.requests().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("review request did not reach the server");
+
+    codex.submit(Op::Interrupt).await.unwrap();
+
+    let mut exited_review = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match codex
+                .next_event()
+                .await
+                .expect("review cancellation event")
+                .msg
+            {
+                event @ (EventMsg::McpStartupUpdate(_) | EventMsg::McpStartupComplete(_)) => {
+                    panic!("cancelled review forwarded delegate MCP startup: {event:?}")
+                }
+                EventMsg::ExitedReviewMode(ExitedReviewModeEvent { review_output }) => {
+                    assert_eq!(review_output, None);
+                    exited_review = true;
+                }
+                EventMsg::TurnAborted(_) if exited_review => break,
+                EventMsg::TurnAborted(_) => panic!("review turn aborted before review mode exited"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for review cancellation");
+
+    assert_eq!(request_log.requests().len(), 1);
 
     let _codex_home_guard = codex_home;
     server.verify().await;
@@ -482,6 +601,7 @@ async fn review_input_isolated_from_parent_history() {
             "timestamp": "2024-01-01T00:00:00.000Z",
             "type": "session_meta",
             "payload": {
+                "session_id": convo_id,
                 "id": convo_id,
                 "timestamp": "2024-01-01T00:00:00Z",
                 "cwd": ".",
@@ -502,6 +622,7 @@ async fn review_input_isolated_from_parent_history() {
                 text: "parent: earlier user message".to_string(),
             }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let user_json = serde_json::to_value(&user).unwrap();
         let user_line = serde_json::json!({
@@ -521,6 +642,7 @@ async fn review_input_isolated_from_parent_history() {
                 text: "parent: assistant reply".to_string(),
             }],
             phase: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let assistant_json = serde_json::to_value(&assistant).unwrap();
         let assistant_line = serde_json::json!({
@@ -677,13 +799,14 @@ async fn review_history_surfaces_in_parent_session() {
     let followup = "back to parent".to_string();
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: followup.clone(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await
         .unwrap();
@@ -788,23 +911,15 @@ async fn review_uses_overridden_cwd_for_base_branch_merge_base() {
     })
     .await;
 
-    codex
-        .submit(Op::OverrideTurnContext {
-            cwd: Some(repo_path.to_path_buf()),
-            approval_policy: None,
-            approvals_reviewer: None,
-            sandbox_policy: None,
-            permission_profile: None,
-            windows_sandbox_level: None,
-            model: None,
-            effort: None,
-            summary: None,
-            service_tier: None,
-            collaboration_mode: None,
-            personality: None,
-        })
-        .await
-        .unwrap();
+    core_test_support::submit_thread_settings(
+        &codex,
+        codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(local_selections(repo_path.to_path_buf().abs())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
     codex
         .submit(Op::Review {
@@ -866,7 +981,6 @@ async fn start_responses_server_with_sse(
 }
 
 /// Create a conversation configured to talk to the provided mock server.
-#[expect(clippy::expect_used)]
 async fn new_conversation_for_server<F>(
     server: &MockServer,
     codex_home: Arc<TempDir>,
@@ -890,7 +1004,6 @@ where
 }
 
 /// Create a conversation resuming from a rollout file, configured to talk to the provided mock server.
-#[expect(clippy::expect_used)]
 async fn resume_conversation_for_server<F>(
     server: &MockServer,
     codex_home: Arc<TempDir>,

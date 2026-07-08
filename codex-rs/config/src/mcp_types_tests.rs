@@ -1,7 +1,8 @@
 use super::*;
+use codex_utils_path_uri::LegacyAppPathString;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::Path;
 
 #[test]
 fn deserialize_stdio_command_server_config() {
@@ -49,6 +50,36 @@ fn deserialize_stdio_command_server_config_with_args() {
         }
     );
     assert!(cfg.enabled);
+}
+
+#[test]
+fn deserialize_remote_stdio_server_accepts_foreign_absolute_cwd() {
+    #[cfg(not(windows))]
+    let cwd = r"C:\Users\openai\share";
+    #[cfg(windows)]
+    let cwd = "/home/openai/share";
+    let expected_cwd = LegacyAppPathString::from_path(Path::new(cwd));
+    let cfg: McpServerConfig = match toml::from_str(&format!(
+        r#"
+            command = "echo"
+            environment_id = "remote"
+            cwd = {cwd:?}
+        "#
+    )) {
+        Ok(cfg) => cfg,
+        Err(error) => panic!("remote stdio MCP should accept absolute cwd: {error}"),
+    };
+
+    assert_eq!(
+        cfg.transport,
+        McpServerTransportConfig::Stdio {
+            command: "echo".to_string(),
+            args: vec![],
+            env: None,
+            env_vars: Vec::new(),
+            cwd: Some(expected_cwd),
+        }
+    );
 }
 
 #[test]
@@ -167,7 +198,7 @@ fn deserialize_stdio_command_server_config_with_cwd() {
             args: vec![],
             env: None,
             env_vars: Vec::new(),
-            cwd: Some(PathBuf::from("/tmp")),
+            cwd: Some(LegacyAppPathString::from_path(Path::new("/tmp"))),
         }
     );
 }
@@ -395,6 +426,7 @@ fn deserialize_ignores_unknown_server_fields() {
     assert_eq!(
         cfg,
         McpServerConfig {
+            auth: Default::default(),
             transport: McpServerTransportConfig::Stdio {
                 command: "echo".to_string(),
                 args: vec![],
@@ -402,7 +434,7 @@ fn deserialize_ignores_unknown_server_fields() {
                 env_vars: Vec::new(),
                 cwd: None,
             },
-            experimental_environment: None,
+            environment_id: crate::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
             required: false,
             supports_parallel_tool_calls: false,

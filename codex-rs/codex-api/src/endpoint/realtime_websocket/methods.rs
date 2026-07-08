@@ -16,7 +16,8 @@ use crate::endpoint::realtime_websocket::protocol::parse_realtime_event;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::backoff;
-use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_http_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
@@ -227,8 +228,12 @@ impl RealtimeWebsocketConnection {
         self.writer.send_audio_frame(frame).await
     }
 
-    pub async fn send_conversation_item_create(&self, text: String) -> Result<(), ApiError> {
-        self.writer.send_conversation_item_create(text).await
+    pub async fn send_conversation_item_create(
+        &self,
+        text: String,
+        role: ConversationTextRole,
+    ) -> Result<(), ApiError> {
+        self.writer.send_conversation_item_create(text, role).await
     }
 
     pub async fn send_conversation_function_call_output(
@@ -286,9 +291,29 @@ impl RealtimeWebsocketWriter {
             .await
     }
 
-    pub async fn send_conversation_item_create(&self, text: String) -> Result<(), ApiError> {
-        self.send_json(&conversation_item_create_message(self.event_parser, text))
-            .await
+    pub async fn send_conversation_item_create(
+        &self,
+        text: String,
+        role: ConversationTextRole,
+    ) -> Result<(), ApiError> {
+        self.send_json(&conversation_item_create_message(
+            self.event_parser,
+            text,
+            role,
+        ))
+        .await
+    }
+
+    pub async fn send_conversation_handoff_append(
+        &self,
+        handoff_id: String,
+        output_text: String,
+    ) -> Result<(), ApiError> {
+        self.send_json(&RealtimeOutboundMessage::ConversationHandoffAppend {
+            handoff_id,
+            output_text,
+        })
+        .await
     }
 
     pub async fn send_conversation_function_call_output(
@@ -366,6 +391,13 @@ impl RealtimeWebsocketWriter {
 }
 
 impl RealtimeWebsocketEvents {
+    pub async fn take_transcript_tail(&self) -> Vec<RealtimeTranscriptEntry> {
+        let mut active_transcript = self.active_transcript.lock().await;
+        let tail = active_transcript.entries[active_transcript.last_handoff_entry_count..].to_vec();
+        active_transcript.last_handoff_entry_count = active_transcript.entries.len();
+        tail
+    }
+
     pub async fn next_event(&self) -> Result<Option<RealtimeEvent>, ApiError> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Ok(None);
@@ -937,6 +969,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn takes_only_transcript_after_last_handoff_once() {
+        let (_tx_message, rx_message) = async_channel::unbounded();
+        let events = RealtimeWebsocketEvents {
+            rx_message,
+            active_transcript: Arc::new(Mutex::new(ActiveTranscriptState::default())),
+            event_parser: RealtimeEventParser::V1,
+            is_closed: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert_eq!(events.take_transcript_tail().await, vec![]);
+
+        let mut covered = RealtimeEvent::InputTranscriptDelta(RealtimeTranscriptDelta {
+            delta: "already handed off".to_string(),
+        });
+        events.update_active_transcript(&mut covered).await;
+        let mut handoff = RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
+            handoff_id: "handoff_1".to_string(),
+            item_id: "item_1".to_string(),
+            input_transcript: "already handed off".to_string(),
+            active_transcript: vec![],
+        });
+        events.update_active_transcript(&mut handoff).await;
+        assert_eq!(
+            handoff,
+            RealtimeEvent::HandoffRequested(RealtimeHandoffRequested {
+                handoff_id: "handoff_1".to_string(),
+                item_id: "item_1".to_string(),
+                input_transcript: "already handed off".to_string(),
+                active_transcript: vec![RealtimeTranscriptEntry {
+                    role: "user".to_string(),
+                    text: "already handed off".to_string(),
+                }],
+            })
+        );
+
+        let mut tail = RealtimeEvent::OutputTranscriptDelta(RealtimeTranscriptDelta {
+            delta: "tail".to_string(),
+        });
+        events.update_active_transcript(&mut tail).await;
+        assert_eq!(
+            events.take_transcript_tail().await,
+            vec![RealtimeTranscriptEntry {
+                role: "assistant".to_string(),
+                text: "tail".to_string(),
+            }]
+        );
+        assert_eq!(events.take_transcript_tail().await, vec![]);
+    }
+
     #[test]
     fn parse_input_transcript_delta_event() {
         let payload = json!({
@@ -989,6 +1071,22 @@ mod tests {
             parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
             Some(RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
                 text: "hello world".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_v1_input_transcript_turn_marked_event() {
+        let payload = json!({
+            "type": "conversation.input_transcript.turn_marked",
+            "transcript": "hello realtime"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
+                text: "hello realtime".to_string(),
             }))
         );
     }
@@ -1581,6 +1679,11 @@ mod tests {
                 .expect("text");
             let third_json: Value = serde_json::from_str(&third).expect("json");
             assert_eq!(third_json["type"], "conversation.item.create");
+            assert_eq!(third_json["item"]["role"], "developer");
+            assert_eq!(
+                third_json["item"]["content"][0]["type"],
+                Value::String("input_text".to_string())
+            );
             assert_eq!(third_json["item"]["content"][0]["text"], "hello agent");
 
             let fourth = ws
@@ -1591,10 +1694,29 @@ mod tests {
                 .into_text()
                 .expect("text");
             let fourth_json: Value = serde_json::from_str(&fourth).expect("json");
-            assert_eq!(fourth_json["type"], "conversation.handoff.append");
-            assert_eq!(fourth_json["handoff_id"], "handoff_1");
+            assert_eq!(fourth_json["type"], "conversation.item.create");
+            assert_eq!(fourth_json["item"]["role"], "assistant");
             assert_eq!(
-                fourth_json["output_text"],
+                fourth_json["item"]["content"][0]["type"],
+                Value::String("output_text".to_string())
+            );
+            assert_eq!(
+                fourth_json["item"]["content"][0]["text"],
+                Value::String("assistant context".to_string())
+            );
+
+            let fifth = ws
+                .next()
+                .await
+                .expect("fifth msg")
+                .expect("fifth msg ok")
+                .into_text()
+                .expect("text");
+            let fifth_json: Value = serde_json::from_str(&fifth).expect("json");
+            assert_eq!(fifth_json["type"], "conversation.handoff.append");
+            assert_eq!(fifth_json["handoff_id"], "handoff_1");
+            assert_eq!(
+                fifth_json["output_text"],
                 "\"Agent Final Message\":\n\nhello from background agent"
             );
 
@@ -1714,9 +1836,19 @@ mod tests {
             .await
             .expect("send audio");
         connection
-            .send_conversation_item_create("hello agent".to_string())
+            .send_conversation_item_create(
+                "hello agent".to_string(),
+                ConversationTextRole::Developer,
+            )
             .await
             .expect("send item");
+        connection
+            .send_conversation_item_create(
+                "assistant context".to_string(),
+                ConversationTextRole::Assistant,
+            )
+            .await
+            .expect("send assistant item");
         connection
             .send_conversation_function_call_output(
                 "handoff_1".to_string(),
@@ -1916,6 +2048,7 @@ mod tests {
                 .expect("text");
             let second_json: Value = serde_json::from_str(&second).expect("json");
             assert_eq!(second_json["type"], "conversation.item.create");
+            assert_eq!(second_json["item"]["role"], "developer");
             assert_eq!(
                 second_json["item"]["type"],
                 Value::String("message".to_string())
@@ -1938,16 +2071,35 @@ mod tests {
                 .expect("text");
             let third_json: Value = serde_json::from_str(&third).expect("json");
             assert_eq!(third_json["type"], "conversation.item.create");
+            assert_eq!(third_json["item"]["role"], "assistant");
             assert_eq!(
-                third_json["item"]["type"],
+                third_json["item"]["content"][0]["type"],
+                Value::String("output_text".to_string())
+            );
+            assert_eq!(
+                third_json["item"]["content"][0]["text"],
+                Value::String("assistant context".to_string())
+            );
+
+            let fourth = ws
+                .next()
+                .await
+                .expect("fourth msg")
+                .expect("fourth msg ok")
+                .into_text()
+                .expect("text");
+            let fourth_json: Value = serde_json::from_str(&fourth).expect("json");
+            assert_eq!(fourth_json["type"], "conversation.item.create");
+            assert_eq!(
+                fourth_json["item"]["type"],
                 Value::String("function_call_output".to_string())
             );
             assert_eq!(
-                third_json["item"]["call_id"],
+                fourth_json["item"]["call_id"],
                 Value::String("call_1".to_string())
             );
             assert_eq!(
-                third_json["item"]["output"],
+                fourth_json["item"]["output"],
                 Value::String("delegated result".to_string())
             );
         });
@@ -1998,9 +2150,19 @@ mod tests {
         );
 
         connection
-            .send_conversation_item_create("delegate this".to_string())
+            .send_conversation_item_create(
+                "delegate this".to_string(),
+                ConversationTextRole::Developer,
+            )
             .await
             .expect("send text item");
+        connection
+            .send_conversation_item_create(
+                "assistant context".to_string(),
+                ConversationTextRole::Assistant,
+            )
+            .await
+            .expect("send assistant item");
         connection
             .send_conversation_function_call_output(
                 "call_1".to_string(),

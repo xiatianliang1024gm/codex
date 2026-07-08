@@ -2,9 +2,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
 use std::time::Duration;
 
+use codex_utils_path_uri::LegacyAppPathString;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -13,12 +13,16 @@ use serde::de::Error as SerdeError;
 
 use crate::RequirementSource;
 
+/// Effective MCP environment id when config omits `environment_id`.
+pub const DEFAULT_MCP_SERVER_ENVIRONMENT_ID: &str = "local";
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AppToolApproval {
     #[default]
     Auto,
     Prompt,
+    Writes,
     Approve,
 }
 
@@ -123,14 +127,43 @@ pub struct McpServerOAuthConfig {
     pub client_id: Option<String>,
 }
 
+/// Authentication flow Codex attempts after resolving an HTTP MCP server's
+/// configured bearer token and authorization headers, which always take
+/// precedence. ChatGPT authentication falls back to stored OAuth credentials
+/// when its session provider is unavailable; both modes ultimately fall back
+/// to an unauthenticated connection.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerAuth {
+    /// Use stored MCP OAuth credentials when available. Starting an OAuth login
+    /// is a separate operation.
+    #[default]
+    #[serde(rename = "oauth")]
+    OAuth,
+    /// Use the current ChatGPT session for servers on the trusted first-party
+    /// ChatGPT origin. If no ChatGPT session provider is available, startup can
+    /// still fall back to stored OAuth credentials.
+    #[serde(rename = "chatgpt")]
+    ChatGpt,
+}
+
+impl McpServerAuth {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     #[serde(flatten)]
     pub transport: McpServerTransportConfig,
 
-    /// Experimental environment selector for where Codex should start this MCP server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub experimental_environment: Option<String>,
+    /// Authentication flow to use when no configured authorization resolves.
+    #[serde(default, skip_serializing_if = "McpServerAuth::is_default")]
+    pub auth: McpServerAuth,
+
+    /// Effective environment id for where Codex should start this MCP server.
+    pub environment_id: String,
 
     /// When `false`, Codex skips initializing this MCP server.
     #[serde(default = "default_enabled")]
@@ -190,6 +223,10 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    pub fn is_local_environment(&self) -> bool {
+        self.environment_id == DEFAULT_MCP_SERVER_ENVIRONMENT_ID
+    }
+
     pub fn oauth_client_id(&self) -> Option<&str> {
         self.oauth
             .as_ref()
@@ -218,7 +255,7 @@ pub struct RawMcpServerConfig {
     #[serde(default)]
     pub env_vars: Option<Vec<McpServerEnvVar>>,
     #[serde(default)]
-    pub cwd: Option<PathBuf>,
+    pub cwd: Option<LegacyAppPathString>,
     pub http_headers: Option<HashMap<String, String>>,
     #[serde(default)]
     pub env_http_headers: Option<HashMap<String, String>>,
@@ -231,7 +268,9 @@ pub struct RawMcpServerConfig {
 
     // shared
     #[serde(default)]
-    pub experimental_environment: Option<String>,
+    pub environment_id: Option<String>,
+    #[serde(default)]
+    pub auth: Option<McpServerAuth>,
     #[serde(default)]
     pub startup_timeout_sec: Option<f64>,
     #[serde(default)]
@@ -279,7 +318,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             url,
             bearer_token,
             bearer_token_env_var,
-            experimental_environment,
+            environment_id,
+            auth,
             startup_timeout_sec,
             startup_timeout_ms,
             tool_timeout_sec,
@@ -323,6 +363,7 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             throw_if_set("stdio", "env_http_headers", env_http_headers.as_ref())?;
             throw_if_set("stdio", "oauth", oauth.as_ref())?;
             throw_if_set("stdio", "oauth_resource", oauth_resource.as_ref())?;
+            throw_if_set("stdio", "auth", auth.as_ref())?;
             let env_vars = env_vars.unwrap_or_default();
             for env_var in &env_vars {
                 env_var.validate_source()?;
@@ -350,9 +391,13 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
             return Err("invalid transport".to_string());
         };
 
+        let environment_id =
+            environment_id.unwrap_or_else(|| DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string());
+
         Ok(Self {
             transport,
-            experimental_environment,
+            auth: auth.unwrap_or_default(),
+            environment_id,
             startup_timeout_sec,
             tool_timeout_sec,
             enabled: enabled.unwrap_or_else(default_enabled),
@@ -398,7 +443,7 @@ pub enum McpServerTransportConfig {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env_vars: Vec<McpServerEnvVar>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<PathBuf>,
+        cwd: Option<LegacyAppPathString>,
     },
     /// https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#streamable-http
     StreamableHttp {

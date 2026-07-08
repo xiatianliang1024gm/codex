@@ -1,6 +1,7 @@
 #![cfg(not(target_os = "windows"))]
 
 use anyhow::Ok;
+use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
@@ -17,6 +18,7 @@ use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use core_test_support::PathBufExt;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_image_generation_call;
@@ -34,6 +36,7 @@ use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -44,30 +47,28 @@ use std::path::PathBuf;
 
 fn disabled_plan_turn(
     text: &str,
-    model: String,
+    _model: String,
     collaboration_mode: CollaborationMode,
 ) -> anyhow::Result<Op> {
-    let cwd = std::env::current_dir()?;
+    let cwd = std::env::current_dir()?.abs();
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd.as_path());
-    Ok(Op::UserTurn {
-        environments: None,
+    Ok(Op::UserInput {
         items: vec![UserInput::Text {
             text: text.into(),
             text_elements: Vec::new(),
         }],
         final_output_json_schema: None,
-        cwd,
-        approval_policy: AskForApproval::Never,
-        approvals_reviewer: None,
-        sandbox_policy,
-        permission_profile,
-        model,
-        effort: None,
-        summary: None,
-        service_tier: None,
-        collaboration_mode: Some(collaboration_mode),
-        personality: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+            environments: Some(local_selections(cwd)),
+            approval_policy: Some(AskForApproval::Never),
+            sandbox_policy: Some(sandbox_policy),
+            permission_profile,
+            collaboration_mode: Some(collaboration_mode),
+            ..Default::default()
+        },
     })
 }
 
@@ -117,10 +118,11 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![expected_input.clone()],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -172,13 +174,14 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "please summarize results".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -232,13 +235,14 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "explain your reasoning".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -293,13 +297,14 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "find the weather".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -344,7 +349,7 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
+async fn builtin_image_generation_call_persisted() -> anyhow::Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -365,20 +370,21 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
 
     let first_response = sse(vec![
         ev_response_created("resp-1"),
-        ev_image_generation_call(call_id, "completed", "A tiny blue square", "Zm9v"),
+        ev_image_generation_call(call_id, "generating", "A tiny blue square", "Zm9v"),
         ev_completed("resp-1"),
     ]);
     mount_sse_once(&server, first_response).await;
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "generate a tiny blue square".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -417,7 +423,7 @@ async fn image_generation_call_event_is_emitted() -> anyhow::Result<()> {
     assert_eq!(completed.0.id, call_id);
     assert!(completed.1 > 0);
     assert_eq!(end.call_id, call_id);
-    assert_eq!(end.status, "completed");
+    assert_eq!(end.status, "generating");
     assert_eq!(end.revised_prompt, Some("A tiny blue square".to_string()));
     assert_eq!(end.result, "Zm9v");
     assert_eq!(
@@ -458,13 +464,14 @@ async fn image_generation_call_event_is_emitted_when_image_save_fails() -> anyho
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "generate an image".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -513,13 +520,14 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "please stream text".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -1096,13 +1104,14 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "reason through it".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 
@@ -1123,6 +1132,98 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
     assert_eq!(delta_event.item_id, reasoning_item.id);
     assert_eq!(delta_event.delta, "step one");
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sequential_cutoff_renders_done_summaries_for_active_reasoning_item() -> anyhow::Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::ConcurrentReasoningSummaries)
+                .expect("test config should allow feature update");
+        })
+        .build(&server)
+        .await?;
+    let summary_done = |item_id: &str, summary_index: i64, text: &str| {
+        serde_json::json!({
+            "type": "response.reasoning_summary_text.done",
+            "item_id": item_id,
+            "summary_index": summary_index,
+            "text": text,
+        })
+    };
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_reasoning_item_added("reasoning-1", &[""]),
+            // Sequential cutoff renders atomic done events, not partial legacy events.
+            ev_reasoning_summary_text_delta("partial"),
+            summary_done("reasoning-1", 0, "step one"),
+            summary_done("reasoning-1", 1, "step two"),
+            ev_reasoning_item("reasoning-1", &["step one", "step two"], &[]),
+            ev_message_item_added("message-1", ""),
+            // Drop a stale completion rather than attaching it to the active message.
+            summary_done("reasoning-1", 2, "late step"),
+            ev_output_text_delta("Done"),
+            ev_assistant_message("message-1", "Done"),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "reason through it".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let reasoning_item = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::Reasoning(item),
+            ..
+        }) => Some(item.clone()),
+        _ => None,
+    })
+    .await;
+
+    let mut summary_deltas = Vec::new();
+    let mut summary_sections = Vec::new();
+    loop {
+        match wait_for_event(&codex, |_| true).await {
+            EventMsg::ReasoningContentDelta(event) => {
+                summary_deltas.push((event.item_id, event.delta, event.summary_index));
+            }
+            EventMsg::AgentReasoningSectionBreak(event) => {
+                summary_sections.push((event.item_id, event.summary_index));
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        summary_deltas,
+        vec![
+            (reasoning_item.id.clone(), "step one".to_string(), 0),
+            (reasoning_item.id, "step two".to_string(), 1),
+        ]
+    );
+    assert_eq!(summary_sections, vec![("reasoning-1".to_string(), 1)]);
     Ok(())
 }
 
@@ -1150,13 +1251,14 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
 
     codex
         .submit(Op::UserInput {
-            environments: None,
             items: vec![UserInput::Text {
                 text: "show raw reasoning".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
         })
         .await?;
 

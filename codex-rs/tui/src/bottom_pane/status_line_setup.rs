@@ -15,7 +15,7 @@
 //! - Permissions profile
 //! - Approval mode
 //! - Context usage (remaining %, used %, window size)
-//! - Usage limits (5-hour, weekly)
+//! - Usage limits (primary, secondary)
 //! - Session info (thread title, thread ID, tokens used)
 //! - Application version
 
@@ -60,6 +60,9 @@ pub(crate) enum StatusLineItem {
     /// Model name with reasoning level suffix.
     ModelWithReasoning,
 
+    /// Current reasoning level.
+    Reasoning,
+
     /// Current working directory path.
     CurrentDir,
 
@@ -100,10 +103,10 @@ pub(crate) enum StatusLineItem {
     #[strum(to_string = "context-used", serialize = "context-usage")]
     ContextUsed,
 
-    /// Remaining usage on the 5-hour rate limit.
+    /// Remaining usage on the primary rate limit.
     FiveHourLimit,
 
-    /// Remaining usage on the weekly rate limit.
+    /// Remaining usage on the secondary rate limit.
     WeeklyLimit,
 
     /// Codex application version.
@@ -134,6 +137,9 @@ pub(crate) enum StatusLineItem {
     /// Current thread title (if set by user).
     ThreadTitle,
 
+    /// Current workspace notification headline.
+    WorkspaceHeadline,
+
     /// Latest checklist task progress from `update_plan` (if available).
     TaskProgress,
 }
@@ -144,6 +150,7 @@ impl StatusLineItem {
         match self {
             StatusLineItem::ModelName => "Current model name",
             StatusLineItem::ModelWithReasoning => "Current model name with reasoning level",
+            StatusLineItem::Reasoning => "Current reasoning level",
             StatusLineItem::CurrentDir => "Current working directory",
             StatusLineItem::ProjectRoot => "Project name (omitted when unavailable)",
             StatusLineItem::GitBranch => "Current Git branch (omitted when unavailable)",
@@ -163,10 +170,10 @@ impl StatusLineItem {
                 "Percentage of context window used (omitted when unknown)"
             }
             StatusLineItem::FiveHourLimit => {
-                "Remaining usage on 5-hour usage limit (omitted when unavailable)"
+                "Remaining usage on the primary usage limit (omitted when unavailable)"
             }
             StatusLineItem::WeeklyLimit => {
-                "Remaining usage on weekly usage limit (omitted when unavailable)"
+                "Remaining usage on the secondary usage limit (omitted when unavailable)"
             }
             StatusLineItem::CodexVersion => "Codex application version",
             StatusLineItem::ContextWindowSize => {
@@ -181,6 +188,9 @@ impl StatusLineItem {
             StatusLineItem::ThreadTitle => {
                 "Current thread title, or thread identifier when unnamed"
             }
+            StatusLineItem::WorkspaceHeadline => {
+                "Workspace notification headline (Enterprise workspaces only; omitted when unavailable)"
+            }
             StatusLineItem::TaskProgress => {
                 "Latest task progress from update_plan (omitted until available)"
             }
@@ -191,6 +201,7 @@ impl StatusLineItem {
         match self {
             StatusLineItem::ModelName => StatusSurfacePreviewItem::Model,
             StatusLineItem::ModelWithReasoning => StatusSurfacePreviewItem::ModelWithReasoning,
+            StatusLineItem::Reasoning => StatusSurfacePreviewItem::Reasoning,
             StatusLineItem::CurrentDir => StatusSurfacePreviewItem::CurrentDir,
             StatusLineItem::ProjectRoot => StatusSurfacePreviewItem::ProjectRoot,
             StatusLineItem::GitBranch => StatusSurfacePreviewItem::GitBranch,
@@ -212,6 +223,7 @@ impl StatusLineItem {
             StatusLineItem::FastMode => StatusSurfacePreviewItem::FastMode,
             StatusLineItem::RawOutput => StatusSurfacePreviewItem::RawOutput,
             StatusLineItem::ThreadTitle => StatusSurfacePreviewItem::ThreadTitle,
+            StatusLineItem::WorkspaceHeadline => StatusSurfacePreviewItem::WorkspaceHeadline,
             StatusLineItem::TaskProgress => StatusSurfacePreviewItem::TaskProgress,
         }
     }
@@ -268,7 +280,11 @@ impl StatusLineSetupView {
                 if !used_ids.insert(item_id.clone()) {
                     continue;
                 }
-                items.push(Self::status_line_select_item(item, /*enabled*/ true));
+                items.push(Self::status_line_select_item(
+                    item,
+                    /*enabled*/ true,
+                    &preview_data,
+                ));
             }
         }
 
@@ -277,7 +293,11 @@ impl StatusLineSetupView {
             if used_ids.contains(&item_id) {
                 continue;
             }
-            items.push(Self::status_line_select_item(item, /*enabled*/ false));
+            items.push(Self::status_line_select_item(
+                item,
+                /*enabled*/ false,
+                &preview_data,
+            ));
         }
 
         Self {
@@ -324,11 +344,25 @@ impl StatusLineSetupView {
     }
 
     /// Converts a [`StatusLineItem`] into a [`MultiSelectItem`] for the picker.
-    fn status_line_select_item(item: StatusLineItem, enabled: bool) -> MultiSelectItem {
+    fn status_line_select_item(
+        item: StatusLineItem,
+        enabled: bool,
+        preview_data: &StatusSurfacePreviewData,
+    ) -> MultiSelectItem {
+        let default_name = item.to_string();
+        let default_description = item.description();
+        let (name, description) = match item {
+            StatusLineItem::FiveHourLimit | StatusLineItem::WeeklyLimit => (
+                preview_data.rate_limit_item_name(item.preview_item(), &default_name),
+                preview_data.rate_limit_item_description(item.preview_item(), default_description),
+            ),
+            _ => (default_name, default_description.to_string()),
+        };
+
         MultiSelectItem {
             id: item.to_string(),
-            name: item.to_string(),
-            description: Some(item.description().to_string()),
+            name,
+            description: Some(description),
             enabled,
             orderable: true,
             section_break_after: false,
@@ -425,6 +459,15 @@ mod tests {
         assert_eq!(
             "model-name".parse::<StatusLineItem>(),
             Ok(StatusLineItem::ModelName)
+        );
+    }
+
+    #[test]
+    fn reasoning_is_selectable_id() {
+        assert_eq!(StatusLineItem::Reasoning.to_string(), "reasoning");
+        assert_eq!(
+            "reasoning".parse::<StatusLineItem>(),
+            Ok(StatusLineItem::Reasoning)
         );
     }
 
@@ -616,7 +659,7 @@ mod tests {
                 ),
                 (
                     StatusLineItem::WeeklyLimit.preview_item(),
-                    "weekly 82%".to_string(),
+                    "weekly 82% left".to_string(),
                 ),
             ]),
             AppEventSender::new(tx_raw),
