@@ -69,7 +69,6 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
-        .without_auto_env()
         .with_env_overrides(&[("OPENAI_API_KEY", None)])
         .build()
         .await?;
@@ -86,6 +85,7 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
                 request_attestation: true,
                 opt_out_notification_methods: None,
                 mcp_server_openai_form_elicitation: false,
+                extensions: None,
             }),
         ),
     )
@@ -95,7 +95,7 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
     };
 
     let thread_request_id = mcp
-        .send_thread_start_request(ThreadStartParams::default())
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
         .await?;
     let thread_response: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -135,7 +135,7 @@ async fn attestation_generate_round_trip_adds_header_to_responses_websocket_hand
                     mcp.send_response(
                         request_id,
                         serde_json::to_value(AttestationGenerateResponse {
-                            token: ATTESTATION_HEADER.to_string(),
+                            token: ATTESTATION_HEADER.into(),
                         })?,
                     )
                     .await?;

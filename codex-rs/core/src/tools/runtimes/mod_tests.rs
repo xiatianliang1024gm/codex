@@ -88,14 +88,14 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
     let mut env = HashMap::from([("CUSTOM_ENV".to_string(), "kept".to_string())]);
     proxy.apply_to_env(&mut env);
 
-    let command = vec!["/bin/echo".to_string(), "ok".to_string()];
-    let command = build_sandbox_command(
-        &command,
-        &command_cwd,
-        &exec_env_for_sandbox_permissions(&env, SandboxPermissions::RequireEscalated),
-        /*additional_permissions*/ None,
-    )
-    .expect("build sandbox command");
+    let command = codex_sandboxing::SandboxCommand {
+        program: "/bin/echo".into(),
+        args: vec!["ok".to_string()],
+        cwd: PathUri::from_abs_path(&command_cwd),
+        env: exec_env_for_sandbox_permissions(&env, SandboxPermissions::RequireEscalated),
+        managed_network: None,
+        additional_permissions: None,
+    };
     assert_eq!(command.cwd, PathUri::from_abs_path(&command_cwd));
     let sandbox_policy_cwd = PathUri::from_abs_path(&native_sandbox_policy_cwd);
     let options = ExecOptions {
@@ -112,7 +112,7 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
         enforce_managed_network: false,
         manager: &manager,
         sandbox_cwd: &sandbox_policy_cwd,
-        workspace_roots: std::slice::from_ref(&native_sandbox_policy_cwd),
+        workspace_roots: std::slice::from_ref(&sandbox_policy_cwd),
         codex_linux_sandbox_exe: None,
         use_legacy_landlock: false,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -233,24 +233,6 @@ fn runtime_path_prepends_ignores_empty_path_entry() {
         runtime_path_prepends,
         RuntimePathPrepends::default(),
         "empty runtime PATH prepend should not be recorded for snapshot replay"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn prepend_zsh_fork_bin_to_path_ignores_empty_parent() {
-    let mut env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
-
-    let result = prepend_zsh_fork_bin_to_path(&mut env, PathBuf::from("zsh").as_path());
-
-    assert_eq!(
-        result, None,
-        "zsh fork helper should not report a PATH update for an empty parent"
-    );
-    assert_eq!(
-        env.get("PATH").map(String::as_str),
-        Some("/usr/bin:/bin"),
-        "zsh fork helper should leave PATH unchanged when the parent is empty"
     );
 }
 
@@ -605,6 +587,105 @@ fn maybe_wrap_shell_lc_with_snapshot_unsets_absent_permission_profile() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"");
+}
+
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_restores_apply_patch_rollout_state() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot_path,
+        "# Snapshot file\nexport CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS='stale'\n",
+    )
+    .expect("write snapshot");
+    let (session_shell, shell_snapshot) =
+        shell_with_snapshot(ShellType::Bash, "/bin/bash", snapshot_path.abs());
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        "printenv CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS".to_string(),
+    ];
+    let env = HashMap::from([(
+        CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR.to_string(),
+        "1".to_string(),
+    )]);
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        Some(&shell_snapshot),
+        &HashMap::new(),
+        &env,
+        &RuntimePathPrepends::default(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env(CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR, "1")
+        .output()
+        .expect("run rewritten command");
+
+    assert!(output.status.success(), "command failed: {output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+
+    let rewritten = maybe_wrap_shell_lc_with_snapshot(
+        &command,
+        &session_shell,
+        Some(&shell_snapshot),
+        &HashMap::new(),
+        &HashMap::new(),
+        &RuntimePathPrepends::default(),
+    );
+    let output = Command::new(&rewritten[0])
+        .args(&rewritten[1..])
+        .env_remove(CODEX_APPLY_PATCH_PRESERVE_LINE_ENDINGS_ENV_VAR)
+        .output()
+        .expect("run rewritten command");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout, b"");
+}
+
+#[test]
+fn maybe_wrap_shell_lc_with_snapshot_restores_reserved_metrics_output_env() {
+    let dir = tempdir().expect("create temp dir");
+    let snapshot_path = dir.path().join("snapshot.sh");
+    std::fs::write(
+        &snapshot_path,
+        "# Snapshot file\nexport CODEX_PLUGIN_METRICS_OUTPUT='/stale/path'\n",
+    )
+    .expect("write snapshot");
+    let (session_shell, shell_snapshot) =
+        shell_with_snapshot(ShellType::Bash, "/bin/bash", snapshot_path.abs());
+    let command = vec![
+        "/bin/bash".to_string(),
+        "-lc".to_string(),
+        "printf '%s' \"${CODEX_PLUGIN_METRICS_OUTPUT-unset}\"".to_string(),
+    ];
+
+    for (live_value, expected) in [(None, "unset"), (Some("/private/path"), "/private/path")] {
+        let env = live_value
+            .map(|value| {
+                HashMap::from([(PLUGIN_METRICS_OUTPUT_ENV_VAR.to_string(), value.to_string())])
+            })
+            .unwrap_or_default();
+        let rewritten = maybe_wrap_shell_lc_with_snapshot(
+            &command,
+            &session_shell,
+            Some(&shell_snapshot),
+            &HashMap::new(),
+            &env,
+            &RuntimePathPrepends::default(),
+        );
+        let mut process = Command::new(&rewritten[0]);
+        process.args(&rewritten[1..]);
+        match live_value {
+            Some(value) => process.env(PLUGIN_METRICS_OUTPUT_ENV_VAR, value),
+            None => process.env_remove(PLUGIN_METRICS_OUTPUT_ENV_VAR),
+        };
+        let output = process.output().expect("run rewritten command");
+
+        assert!(output.status.success(), "command failed: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
 }
 
 #[test]
@@ -1082,10 +1163,16 @@ fn maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv() {
         "-lc".to_string(),
         "printf '%s' \"$OPENAI_API_KEY\"".to_string(),
     ];
-    let explicit_env_overrides = HashMap::from([(
-        "OPENAI_API_KEY".to_string(),
-        "super-secret-value".to_string(),
-    )]);
+    let explicit_env_overrides = HashMap::from([
+        (
+            "OPENAI_API_KEY".to_string(),
+            "super-secret-value".to_string(),
+        ),
+        (
+            "openai_identity_token_file".to_string(),
+            "/run/identity-token".to_string(),
+        ),
+    ]);
     let rewritten = maybe_wrap_shell_lc_with_snapshot(
         &command,
         &session_shell,
@@ -1099,6 +1186,7 @@ fn maybe_wrap_shell_lc_with_snapshot_does_not_embed_override_values_in_argv() {
     );
 
     assert!(!rewritten[2].contains("super-secret-value"));
+    assert!(!rewritten[2].contains("openai_identity_token_file"));
     let output = Command::new(&rewritten[0])
         .args(&rewritten[1..])
         .env("OPENAI_API_KEY", "super-secret-value")

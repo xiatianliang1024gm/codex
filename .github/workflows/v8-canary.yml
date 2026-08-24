@@ -17,9 +17,9 @@ jobs:
   metadata:
     runs-on: ubuntu-latest
     outputs:
-      # A stale PR head can contain the old detector, which does not emit this
-      # output. Missing must mean "run" so older branches cannot silently skip
-      # the expensive V8 coverage while reporting success.
+      # Older revisions can contain a detector that does not emit this output.
+      # Missing must mean "run" so they cannot silently skip the expensive V8
+      # coverage while reporting success.
       canary_required: ${{ steps.changes.outputs.canary_required || 'true' }}
       v8_version: ${{ steps.v8_version.outputs.version }}
       windows_source_required: ${{ steps.changes.outputs.windows_source_required }}
@@ -27,7 +27,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -173,7 +172,6 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
       - name: Set up Bazel
@@ -308,8 +306,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/upstream-rusty-v8/target
     strategy:
       fail-fast: false
       matrix:
@@ -321,8 +317,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
-      - uses: ./.github/actions/setup-ci
+      - id: setup_ci
+        uses: ./.github/actions/setup-ci
 
       - name: Configure git for upstream checkout
         shell: bash
@@ -335,6 +334,7 @@ jobs:
           ref: v${{ needs.metadata.outputs.v8_version }}
           path: upstream-rusty-v8
           submodules: recursive
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
@@ -366,8 +366,8 @@ jobs:
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: |
-            ${{ env.CARGO_TARGET_DIR }}/sccache
-            ${{ env.CARGO_TARGET_DIR }}/${{ matrix.target }}/release/gn_out
+            ${{ steps.setup_ci.outputs.cargo-target-dir }}/sccache
+            ${{ steps.setup_ci.outputs.cargo-target-dir }}/${{ matrix.target }}/release/gn_out
           key: rusty-v8-source-${{ matrix.target }}-${{ matrix.runner }}-sandbox-${{ hashFiles('upstream-rusty-v8/Cargo.lock', 'upstream-rusty-v8/build.rs', 'upstream-rusty-v8/git_submodule_status.txt') }}
           restore-keys: |
             rusty-v8-source-${{ matrix.target }}-${{ matrix.runner }}-sandbox-
@@ -376,7 +376,7 @@ jobs:
         shell: pwsh
         env:
           SCCACHE_CACHE_SIZE: 256M
-          SCCACHE_DIR: ${{ env.CARGO_TARGET_DIR }}/sccache
+          SCCACHE_DIR: ${{ steps.setup_ci.outputs.cargo-target-dir }}/sccache
           SCCACHE_IDLE_TIMEOUT: 0
         run: |
           $version = "v0.8.2"

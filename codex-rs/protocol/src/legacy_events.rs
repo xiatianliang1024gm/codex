@@ -10,6 +10,8 @@ use crate::items::CommandExecutionStatus;
 use crate::items::ContextCompactionItem;
 use crate::items::DynamicToolCallItem;
 use crate::items::DynamicToolCallStatus;
+use crate::items::EnteredReviewModeItem;
+use crate::items::ExitedReviewModeItem;
 use crate::items::FileChangeItem;
 use crate::items::ImageGenerationItem;
 use crate::items::McpToolCallItem;
@@ -36,10 +38,12 @@ use crate::protocol::CollabWaitingBeginEvent;
 use crate::protocol::CollabWaitingEndEvent;
 use crate::protocol::ContextCompactedEvent;
 use crate::protocol::DynamicToolCallResponseEvent;
+use crate::protocol::EnteredReviewModeEvent;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandBeginEvent;
 use crate::protocol::ExecCommandEndEvent;
 use crate::protocol::ExecCommandStatus;
+use crate::protocol::ExitedReviewModeEvent;
 use crate::protocol::ImageGenerationBeginEvent;
 use crate::protocol::ImageGenerationEndEvent;
 use crate::protocol::ItemCompletedEvent;
@@ -71,18 +75,24 @@ impl ContextCompactionItem {
 }
 
 impl UserMessageItem {
-    pub fn as_legacy_event(&self) -> EventMsg {
+    pub fn as_legacy_user_message_event(&self) -> UserMessageEvent {
         // Legacy user-message events flatten only text inputs into `message` and
         // rebase text element ranges onto that concatenated text.
-        EventMsg::UserMessage(UserMessageEvent {
+        UserMessageEvent {
             client_id: self.client_id.clone(),
             message: self.message(),
             images: Some(self.image_urls()),
             image_details: self.image_details(),
             local_images: self.local_image_paths(),
             local_image_details: self.local_image_details(),
+            audio: Some(self.audio_urls()),
+            local_audio: self.local_audio_paths(),
             text_elements: self.text_elements(),
-        })
+        }
+    }
+
+    pub fn as_legacy_event(&self) -> EventMsg {
+        EventMsg::UserMessage(self.as_legacy_user_message_event())
     }
 }
 
@@ -95,9 +105,31 @@ impl AgentMessageItem {
                     message: text.clone(),
                     phase: self.phase.clone(),
                     memory_citation: self.memory_citation.clone(),
+                    delivery: self.delivery,
                 }),
             })
             .collect()
+    }
+}
+
+impl EnteredReviewModeItem {
+    pub fn as_legacy_event(&self, turn_id: String) -> EventMsg {
+        EventMsg::EnteredReviewMode(EnteredReviewModeEvent {
+            target: self.target.clone(),
+            user_facing_hint: Some(self.user_facing_hint.clone()),
+            turn_id: Some(turn_id),
+            item_id: Some(self.id.clone()),
+        })
+    }
+}
+
+impl ExitedReviewModeItem {
+    pub fn as_legacy_event(&self, turn_id: String) -> EventMsg {
+        EventMsg::ExitedReviewMode(ExitedReviewModeEvent {
+            turn_id: Some(turn_id),
+            item_id: Some(self.id.clone()),
+            review_output: self.review_output.clone(),
+        })
     }
 }
 
@@ -128,6 +160,8 @@ impl CommandExecutionItem {
     pub(crate) fn as_legacy_begin_event(&self, turn_id: String, started_at_ms: i64) -> EventMsg {
         EventMsg::ExecCommandBegin(ExecCommandBeginEvent {
             call_id: self.id.clone(),
+            plugin_id: self.plugin_id.clone(),
+            script_path: self.script_path.clone(),
             process_id: self.process_id.clone(),
             turn_id,
             started_at_ms,
@@ -152,6 +186,8 @@ impl CommandExecutionItem {
         };
         Some(EventMsg::ExecCommandEnd(ExecCommandEndEvent {
             call_id: self.id.clone(),
+            plugin_id: self.plugin_id.clone(),
+            script_path: self.script_path.clone(),
             process_id: self.process_id.clone(),
             turn_id,
             completed_at_ms,
@@ -382,6 +418,7 @@ impl WebSearchItem {
             call_id: self.id.clone(),
             query: self.query.clone(),
             action: self.action.clone(),
+            results: self.results.clone(),
         })
     }
 }
@@ -393,6 +430,8 @@ impl ImageGenerationItem {
             status: self.status.clone(),
             revised_prompt: self.revised_prompt.clone(),
             result: self.result.clone(),
+            transparent_background: None,
+            failure: None,
             saved_path: self.saved_path.clone(),
         })
     }
@@ -435,9 +474,9 @@ impl McpToolCallItem {
             mcp_app_resource_uri: self.mcp_app_resource_uri.clone(),
             link_id: self.link_id.clone(),
             app_name: self.app_name.clone(),
-            template_id: self.template_id.clone(),
             action_name: self.action_name.clone(),
             plugin_id: self.plugin_id.clone(),
+            read_only_hint: self.read_only_hint,
         })
     }
 
@@ -459,9 +498,9 @@ impl McpToolCallItem {
             connector_id: self.connector_id.clone(),
             link_id: self.link_id.clone(),
             app_name: self.app_name.clone(),
-            template_id: self.template_id.clone(),
             action_name: self.action_name.clone(),
             plugin_id: self.plugin_id.clone(),
+            read_only_hint: self.read_only_hint,
             duration: self.duration?,
             result,
         }))
@@ -486,8 +525,9 @@ impl TurnItem {
                     path: item.path.clone(),
                 })]
             }
-            TurnItem::Sleep(_) => Vec::new(),
+            TurnItem::Extension(_) => Vec::new(),
             TurnItem::ImageGeneration(item) => vec![item.as_legacy_event()],
+            TurnItem::EnteredReviewMode(_) | TurnItem::ExitedReviewMode(_) => Vec::new(),
             TurnItem::FileChange(item) => item
                 .as_legacy_end_event(String::new())
                 .into_iter()
@@ -549,6 +589,12 @@ impl HasLegacyEvent for ItemCompletedEvent {
                 .collect(),
             TurnItem::SubAgentActivity(item) => {
                 vec![item.as_legacy_event(self.completed_at_ms)]
+            }
+            TurnItem::EnteredReviewMode(item) => {
+                vec![item.as_legacy_event(self.turn_id.clone())]
+            }
+            TurnItem::ExitedReviewMode(item) => {
+                vec![item.as_legacy_event(self.turn_id.clone())]
             }
             _ => self.item.as_legacy_events(show_raw_agent_reasoning),
         }

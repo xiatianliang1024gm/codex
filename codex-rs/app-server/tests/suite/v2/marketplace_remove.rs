@@ -3,8 +3,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use app_test_support::TestAppServer;
-use app_test_support::to_response;
-use codex_app_server_protocol::JSONRPCResponse;
+use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::MarketplaceRemoveParams;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::RequestId;
@@ -19,8 +18,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn configured_marketplace_update() -> MarketplaceConfigUpdate<'static> {
     MarketplaceConfigUpdate {
-        last_updated: "2026-04-13T00:00:00Z",
-        last_revision: None,
         source_type: "git",
         source: "https://github.com/owner/repo.git",
         ref_name: Some("main"),
@@ -56,22 +53,16 @@ async fn marketplace_remove_deletes_config_and_installed_root() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
-
-    let request_id = mcp
-        .send_marketplace_remove_request(MarketplaceRemoveParams {
-            marketplace_name: "debug".to_string(),
+    let response: MarketplaceRemoveResponse = mcp
+        .request(|request_id| ClientRequest::MarketplaceRemove {
+            request_id,
+            params: MarketplaceRemoveParams {
+                marketplace_name: "debug".to_string(),
+            },
         })
         .await?;
-
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let response: MarketplaceRemoveResponse = to_response(response)?;
     assert_eq!(response.marketplace_name, "debug");
     let removed_installed_root = response
         .installed_root
@@ -98,9 +89,8 @@ async fn marketplace_remove_rejects_unknown_marketplace() -> Result<()> {
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .without_auto_env()
-        .build()
+        .build_initialized()
         .await?;
-    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
     let request_id = mcp
         .send_marketplace_remove_request(MarketplaceRemoveParams {
